@@ -38,7 +38,7 @@ GAME_PLAYERS: Game/player Bridge table for boxscores to game_events
 
 ## Automation
 
-Apache Airflow was then used to automate fetching of new data on the NBA so that new data can be added to the analysis easily.
+Apache Airflow was then used in Docker to automate fetching of new data on the NBA so that new data can be added to the analysis easily.
 The DAG is as follows:
 
 ![image](https://github.com/user-attachments/assets/039c6218-984c-4395-9feb-144b2ad98113)
