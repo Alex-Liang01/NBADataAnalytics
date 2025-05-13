@@ -1,0 +1,11 @@
+{
+    "dockerfile_lines": [],
+    "graphs": {
+      "SQL_agent": "./SQL_agent.py:react_graph"
+    },
+    "python_version": "3.12",
+    "env": "./.env",
+    "dependencies": [
+      "."
+    ]
+  }
