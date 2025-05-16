@@ -5,6 +5,8 @@ import re
 import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, MetaData
+import matplotlib.pyplot as plt
+import matplotlib.figure
 
 # Typing imports
 from typing import Annotated
@@ -12,8 +14,8 @@ from typing_extensions import TypedDict
 
 # Langchain and LangGraph imports
 
-#from langchain_openai import ChatOpenAI
-from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
+# from langchain_ollama import ChatOllama
 
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage
 from langchain_community.utilities import SQLDatabase
@@ -21,9 +23,11 @@ from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langgraph.graph import START, END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from langgraph.errors import GraphRecursionError
 
-
-# Local application imports
+#Streamlit import
+import streamlit as st
+# Config file for connecting to postgres database
 import sqlconfig
 
 
@@ -38,12 +42,11 @@ metadata = MetaData()
 metadata.reflect(bind=engine, schema='nba24_25_s')
 
 # Connecting db to LLM
-db = SQLDatabase(engine=engine, metadata=metadata,schema='nba24_25_s')
+db = SQLDatabase(engine=engine, metadata=metadata,schema='nba24_25_s',sample_rows_in_table_info=1)
 
 # Loading llm
-llm=ChatOllama(model="llama3.1:8b", temperature=0)
-# llm=ChatOpenAI(model="gpt-4o", temperature=0) 
-
+# llm=ChatOllama(model="llama3.1:8b", temperature=0)
+llm=ChatOpenAI(model="gpt-4o", temperature=0) 
 
 # State passed from node to node
 class State(TypedDict):
@@ -51,16 +54,20 @@ class State(TypedDict):
     table_names: str #Table names of database
     schema: str # Schema (Create statements of database)
     sql_query: str # Sql_query generated 
-    last_sql_error: str # Most recent sql error 
     sql_error_bool:bool # Does most recent sql_query contain an error?
-    not_related: str # Is the user query related to the db?
+    not_related: bool # Is the user query related to the db?
     sql_results:str # Results of sql_statement 
     python_df_code:str # Python code to create pandas df from sql_results
     python_df_object: pd.DataFrame # Dataframe object
-    dataframe_init_error: str # Most recent Pandas dataframe init error
     plot_requested_bool: str # Does the user ask for a plot?
     plot_python_code:str # Python plot code
-    last_plot_error:str # Last error in plot_python_code
+    plot_object:plt.Figure # Plot object
+    recursion: bool # Recursion error
+    last_error: str # last error
+
+# Input state that loads messages to main State dictonary above
+class InputState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
 
 
 
@@ -84,11 +91,12 @@ run_query_check_node = ToolNode([query_check_tool], name="run_query_check")
 
 # Initial node reads in table names and schema
 def read_database_metadata(state: State):
+
     #Tool metadata
     tool_call = {
         "name": "sql_db_list_tables",
         "args": {},
-        "id": "abc123",
+        "id": "1",
         "type": "tool_call",
     }
 
@@ -106,7 +114,7 @@ def read_database_metadata(state: State):
     tool_call = {
         "name":"sql_db_schema",
         "args":info_args,
-        "id":"morpeko",
+        "id":"2",
         "type":"tool_call"
     }
 
@@ -114,39 +122,32 @@ def read_database_metadata(state: State):
     schema_message=get_schema_tool.invoke(tool_call)
 
     #Extracting all CREATE statements
-    # create_statements = re.findall(r"CREATE TABLE.*?\/", schema_message.content, re.DOTALL)
+    create_statements = re.findall(r"CREATE TABLE.*?\/", schema_message.content, re.DOTALL)
 
     #Storing all CREATE statements to state for next node
-    # state['schema']="\n".join(create_statements)
+    state['schema']="\n".join(create_statements)
 
     state['schema']=schema_message
     return state
 
 # Checks if prompt is related to db and generates SQL query
 def init_sql_generator(state: State):
-
     # Main prompt for agent
     prompt=f""""
-        You are an expert at determining if the query from the user is related to a query on the database on the NBA provided to you. 
-        You have the following tables available to you: {state['table_names']}
-        The data manipulation language to create the table is as follows: {state['schema']}
-        Determine if the input question from the user "{state['messages'][0].content}" is related to a query on the database provided to you. 
-        If the input query is related to the database based off the schema you have available to you, wrap the SQL statement you create in a response like so: 
+        Determine if user input "{state['messages'][0].content}" is related to a query on the database. 
+        The details of the database is as follow: 
+        Schema of the database: {state.get('schema')}
+        If the user input is related to the database, create the singular SQL SELECT statement to answer the user's query with the following format.
 
-        ``` 
-        SELECT colname from tablename;
-        ```        
-        If the input query is not related, do not write any SQL statements.
-        Always write a SQL statement if the input question is related to the database in any way. 
-        The input query may be limited so make sure to understand if you need to do any joins before being able to do SQL SELECT statements to satisfy the user's query. 
-        Never SELECT id as the only thing to GROUP BY as id's are not interesting.
+        "SELECT colname from tablename;"
+
+        If the user input is not related to the database. Do not write a SQL SELECT statement.     
     """
 
     messages=[
         # System message for behavior of agent
-        SystemMessage(content=f""""You are an agent designed to interact with a SQL database. 
-                      Never return DML statements (INSERT, UPDATE, DELETE, DROP etc.).
-                      Do not make any stretches in your imagination.
+        SystemMessage(content=f""""You are an SQL expert designed to determine if a user input is related to a SQL database. Never use CTEs, use subqueries instead.
+                      Never return DML statements (INSERT, UPDATE, DELETE, DROP etc.). Do not explain your thinking.
                       """),
         HumanMessage(content=f"{prompt}")
     ]
@@ -157,34 +158,25 @@ def init_sql_generator(state: State):
 
     # Extracting SQL statement from response
     select_statements = re.search(r"SELECT.*?;", content, re.DOTALL)
-
     # Setting sql_query for next nodes
     if select_statements:
         sql_query=select_statements.group(0)
         state['sql_query']=sql_query  
     else:
         state['sql_query']=""
-
     return state
 
 # Checks if sql_query is empty. # If empty, prints END signaling graph to end 
 def not_related_to_db(state: State):
-
-    prompt=f"""The provided string is: x = {state['sql_query']}. If the provided string x is empty print "END". If not print "SQL"."""
-
-    messages=[
-        SystemMessage(content=f""""You are an agent designed to print one word. Do not print anything else. Do not write any function."""),
-        HumanMessage(content=f"{prompt}")
-    ]
-
-    response=llm.invoke(messages)
-    state['not_related']=response.content
-
+    if state.get('sql_query')=="":
+        state['not_related']=True
+    else:
+        state['not_related']=False
     return state
 
 # Ends graph if previous node resulted in END statement (User query not related to the DB)
 def end_or_sql_query(state: State):
-    if state['not_related']=='END':
+    if state.get('not_related')==True:
         return True
     else: 
         return False
@@ -192,7 +184,7 @@ def end_or_sql_query(state: State):
 # Checks if SQL query generated in sql_query is valid
 def sql_query_checker(state: State):
     # Invoking tool for checking if sql_query is valid
-    response=query_check_tool.invoke({"query": state['sql_query']})
+    response=query_check_tool.invoke({"query": state.get('sql_query')})
 
     content=response
     # Extracting only the SQL SELECT statement
@@ -212,39 +204,39 @@ def sql_query_checker(state: State):
 def sql_query_executor(state: State):
 
     # Executes SQL Query using tool
-    response=run_query_tool.invoke({"query": state['sql_query']})
+    response=run_query_tool.invoke({"query": state.get('sql_query')})
 
     #Extracts error from tool
-    error = re.search(r"Error:", response, re.DOTALL)
+    error = re.search(r"(Error:\s*.*)", response, re.DOTALL)
 
-    
     if error:
-        # Passes error to sql_query_fixer allowing for next agent to fix query based off error
-        state['last_sql_error']=response
-        state['sql_error_bool']=True
+        # if error is the same as last error infinite loop (Goes to printer)
+        if state.get('last_error'):
+            if state.get('last_error')==error.group(1):
+                state['recursion']=True
+            else:
+                state['last_error']=error.group(1)
+                state['recursion']=False
+        else:
+            # Passes error to sql_query_fixer allowing for next agent to fix query based off error
+            state['last_error']=error.group(1)
+            state['recursion']=False
     else:
+        # No error
+        state['last_error']=None
         state['sql_results']=response
-        state['sql_error_bool']=False
+        state['recursion']=False
   
     return state
 
-# Ends sql fixing loop 
-def is_sql_query_error(state: State):
-    if state['sql_error_bool']==False:
-        return False
-    else:
-        return True
     
 # Fixes SQL statement and loops back to sql_query_executor
 def sql_query_fixer(state: State):
-    
     # Prompt for fixing sql query
-    prompt=f"""This sql query failed: {state['sql_query']}.  
-               The error for the attempted sql query attempted is {state['last_sql_error']}.   
-               Remember that the available tables are {state['table_names']}
-               Remember that the schema of the database is as follows {state['schema']}.       
+    prompt=f"""This sql query failed: {state.get('sql_query')}.  
+               The error for the attempted sql query attempted is {state.get('last_error')}.   
+               The schema of is: {state.get('schema')}.       
     """
-
 
     messages=[
         # System message for sql fixer agent
@@ -274,8 +266,11 @@ def sql_query_fixer(state: State):
 
 # Generates Python code for creating Pandas dataframe
 def df_code_creator(state: State):
-    prompt=f"""This is a sql query {state['sql_query']} with the following results stored in a variable called y {state['sql_results']}.  
-               Print the code to create the Pandas dataframe.
+    prompt=f"""This is a sql query {state.get('sql_query')} with the following results stored in a variable called y {state.get('sql_results')}.  
+               Give me the code to create the Pandas dataframe so that I can store the evaluated string.
+               The format of the code should follow:
+               pd.DataFrame(y, columns=['col1', 'col2',...])
+               Do not wrap the Python code in ```Python ```        
     """
 
     messages=[
@@ -284,7 +279,7 @@ def df_code_creator(state: State):
                       and the results of the SQL query as a list with tuples representing each row of the dataframe.
                       Make sure to give the columns of the pandas dataframe appropriate names.
                       Only return the Python code one liner to create the Pandas dataframe.
-                      Do not explain your thinking. Do not wrap the Python code in ```Python ```                 
+                      Do not explain your thinking.            
                       """),
         HumanMessage(content=f"{prompt}")
     ]
@@ -297,21 +292,28 @@ def df_code_creator(state: State):
 
 # Creating dataframe object in Python and determining if a plot is needed.
 def dataframe_init(state:State):
+
     try:
         # Executing list of sql_results as a variable for Pandas code
-        y=eval(state['sql_results'])
+        y=eval(state.get('sql_results'))
     
         # Executing Python code to create Pandas dataframe and storing Pandas dataframe back to state 
-        df=eval(state['python_df_code'])
+        df=eval(state.get('python_df_code'))
         state['python_df_object']=df
  
         #No dataframe initialization error
-        state['dataframe_init_error']=None
-        
+        state['last_error']=None
+        state['recursion']=False
+
         return state
     # Dataframe initilization error for creation of Pandas Dataframe.     
     except Exception as E:
-        state['dataframe_init_error']=E
+        if (str(state.get('last_error'))==str(E)):
+            state['recursion']=True
+        else:
+            state['last_error']=E
+            state['recursion']=False
+
         return state
     
 # Node for checking if plot is requested
@@ -337,18 +339,20 @@ def plot_requested(state: State):
     return state
 
 # Returns True if there is an dataframe initialization error
-def is_dataframe_init_error(state: State):
-    if state['dataframe_init_error']:
-        return True
+def is_error(state: State):
+    if state.get('recursion'):
+        return "END"
+    elif state.get('last_error'):
+        return True       
     else:
-        return False
+        return False 
     
 def dataframe_init_fixer(state: State):
     prompt=f"""  
-            This is the previous python code that was used to initialize a dataframe {state['python_df_code']}.
-            It resulted in the following error {state['dataframe_init_error']}. 
+            This is the previous python code that was used to initialize a dataframe {state.get('python_df_code')}.
+            It resulted in the following error {state.get('last_error')}. 
             Fix the python code based off of the error. 
-            Do not wrap the python code in ```python ```. 
+            Do not wrap the python code in ```python ``` as it needs to be executable. 
     """
 
     messages=[
@@ -367,7 +371,7 @@ def dataframe_init_fixer(state: State):
 
 # Ending condition if plot is not needed
 def plot_or_end(state: State):
-    if state['plot_requested_bool']=="END":
+    if state.get('plot_requested_bool')=="END":
         return False
     else:
         return True
@@ -378,26 +382,34 @@ def plot_or_end(state: State):
 # Node for generating plots    
 def plot_code_generator(state:State):
     # Prompt for creating Python plot code
-    prompt=f"""This is the query that the user gave to you {state['messages'][0].content}.  
-               The user wants a visualization on the following dataframe stored in df. {state['python_df_object']}
-               Use the appropriate tool to create the visualizations with proper naming of columns as you see appropriate.
-               Return the Python code to create the plot that the user wants. Do not plt.show().
-    """
 
+    prompt=f"""You are a Python plotting assistant. Your task is to generate a Matplotlib plot based on the user's request "{state['messages'][0].content} using the provided Pandas DataFrame {state.get('python_df_object')} named df.
+    Instructions:
+    Interpret the user query and determine the appropriate plot type.
+    Use the Matplotlib library to generate the plot.
+    Use appropriate axis labels and a descriptive title based on the user query.
+    Only return the code needed to generate the plot and assign the figure to y. Do not redefine the variable df.
+    Example Output Format:
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots()
+    # plotting code here using df
+    y = fig
+    Additional Notes:
+    Ensure the code can run independently assuming df is already defined.
+    Handle common plotting needs like setting axis labels and legends.
+    Avoid interactive or inline-specific commands (like %matplotlib inline or plt.show()).
+    Make sure that the python code will be executable with eval.
+    """
     messages=[
-        SystemMessage(content=f""""You are an agent that is an expert at creating Python code for plots. 
-                      Do not explain your thinking. Provide the necessary imports for plotting as well as the python code to create the plot.
-                      Do not define the dataframe in your code.
-                      Do not wrap the code in ```Python ```.            
+        SystemMessage(content=f""""You are an agent that is an expert at creating Python code for plots using matplotlib. 
+                      Do not explain your thinking. Provide the necessary imports for plotting as well as the python code to create the plot. Make sure that the labels are readable.
+                      Do not wrap the code in ```Python ```.                
                      """),
         HumanMessage(content=f"{prompt}")
     ]
 
     response=llm.invoke(messages)
     
-    #print(response.content)
-    # r=AIMessage(content=response.content)
-    # state['messages']=[r]
 
     # Storing Python plot code for execution in other nodes
     state['plot_python_code']=response.content
@@ -408,41 +420,45 @@ def plot_code_generator(state:State):
 def plot_code_executor(state:State):
     try:
         #Storing the Pandas dataframe in variable df
-        df=state['python_df_object']
-        
-        #Executing the Python plot code on df
-        exec(state['plot_python_code'])
+        df=state.get('python_df_object')
 
+        #Executing the Python plot code on df
+        plot_code=state.get('plot_python_code')
+        namespace={'df': df}
+        exec(plot_code,globals(),namespace)
+        fig=namespace.get("y")
+
+        state['plot_object']=fig
         #Setting last_plot_error to if no errors occured
-        state['last_plot_error']=None
+        state['last_error']=None
 
     except Exception as e:
         # Storing Python plot error to state for next nodes
-        state['last_plot_error']=e    
-    return state
+        if str(state.get('last_error'))==str(e):
+            state['recursion']=True
+        else:    
+            state['last_error']=e    
+            state['recursion']=False            
 
-# Condition to end if there is no plot error
-def plot_error(state: State):
-    if state['last_plot_error']:
-        return True
-    else:
-        return False
+    return state
 
 # Node for fixing plot errors
 def plot_error_fixer(state:State):
     # Prompts for plot code fixer agent
     prompt=f"""This is the query that the user gave to you {state['messages'][0].content}.  
-               This is the dataframe that the user wanted to plot {state['python_df_object']}
-               This is the previous Python plot code that resulted in an error {state['plot_python_code']}. 
-               This is the error of the Python plot code {state['last_plot_error']}
+               This is the dataframe that the user wanted to plot {state.get('python_df_object')}
+               This is the previous Python plot code that resulted in an error {state.get('plot_python_code')}. 
+               This is the error of the Python plot code {state.get('last_plot_error')}
                Fix the Python code to correctly handle the error.
-               Return the Python code to create the plot that the user wants with the error fixed. 
+               Return the Python code to create the plot that the user wants with the error fixed. Do not plt.show() and store the plot figure to a variable called y.               
     """
 
     messages=[
         SystemMessage(content=f""""You are an Python agent that is an expert at plotting using matplotlib. 
                       Fix any errors that were provided to you. 
-                      Do not explain your thinking. Only provide the necessary imports for plotting as well as the python code to create the plot. Do not wrap the code in ```Python ```.    
+                      Do not explain your thinking. Only provide the necessary imports for plotting as well as the python code to create the plot. 
+                      Do not wrap the code in ```Python ```. Assign the plot (e.g., a matplotlib figure object) to a variable called y
+                      The code should be a complete, valid Python code that can be executed in isolation. Do not plt.show() and store the plot figure to a variable called y.               
                      """),
         HumanMessage(content=f"{prompt}")
     ]
@@ -450,26 +466,22 @@ def plot_error_fixer(state:State):
     # Returning python plot code back    
     response=llm.invoke(messages)
     state['plot_python_code']=response.content
-   
     return state
 
+# Final print
 def printer(state: State):
-    #Storing the results of the SQL query as a Pandas dataframe to end user. Might want to do this at the end of the graph instead.
-    if state['not_related']=='END':
+    if state.get('not_related')==True:
         final_results=AIMessage(content=f"""Your query is not related to the database.""")
+    elif state.get('recursion'):
+        final_results=AIMessage(content=f"""Your query is related to the database but an error occured. Recheck your query.""")
     else:
-    # elif state['plot_requested_bool']=='END':
-        final_results=AIMessage(content=f"""This is the resulting SQL query: \n\n {state['sql_query']} \n \n This is the resulting dataframe from the SQL query: \n\n {state['python_df_object'].to_markdown(index=False)}""")
-    
-    #else 
+        final_results=AIMessage(content=f"""This is the resulting SQL query: \n\n {state.get('sql_query')}""")
 
     state['messages']=[final_results]
-    
-    
     return state
 
 
-builder = StateGraph(State)
+builder = StateGraph(State, input=InputState)
 
 # adding all the nodes.
 builder.add_node("read_database_metadata", read_database_metadata)          ## Reads metadata of database
@@ -499,19 +511,21 @@ builder.add_conditional_edges("not_related_to_db",end_or_sql_query,{        ## C
  
 builder.add_edge("sql_query_checker","sql_query_executor")                  ## sql_query_checker -> sql_query_executor
 
-builder.add_conditional_edges("sql_query_executor",is_sql_query_error,{     ## Conditional split
-    True: "sql_query_fixer",                                                ## sql_query_executor -----> sql_query_fixer
-    False: "df_code_creator"                                                ## |
-})                                                                          ## -------> df_code_creator
+builder.add_conditional_edges("sql_query_executor",is_error,{               ## sql_query_executor ----> sql_query_fixer
+    True: "sql_query_fixer",                                                ## |-----> df_code_creator
+    False: "df_code_creator",                                               ## | ------> printer
+    "END": "printer"                                     
+})                                                                        
 
 builder.add_edge("sql_query_fixer","sql_query_checker")                     ## sql_query_fixer -> sql_query_checker
 builder.add_edge("df_code_creator","dataframe_init")                        ## df_code_creator -> dataframe_init
 
 
-builder.add_conditional_edges("dataframe_init",is_dataframe_init_error,{    ## Conditional split  
-    True: "dataframe_init_fixer",                                           ## dataframe_init ------> dataframe_init_fixer
-    False: "plot_requested"                                                 ## |
-})                                                                          ## -------> plot_requested
+builder.add_conditional_edges("dataframe_init",is_error, {                  ## dataframe_init ------> dataframe_init_fixer
+        True: "dataframe_init_fixer",                                       ## | -----> plot_requested
+        False: "plot_requested",                                            ## |
+        "END": "printer"                                                    ## -----> printer
+})                                                                         
 
 builder.add_edge("dataframe_init_fixer","dataframe_init")                   ## dataframe_init_fixer -> dataframe_init
 
@@ -523,10 +537,11 @@ builder.add_conditional_edges("plot_requested",plot_or_end,{                ## C
 
 builder.add_edge("plot_code_generator", "plot_code_executor")               ## plot_code_generator -> plot_code_executor
 
-builder.add_conditional_edges("plot_code_executor",plot_error,{             ## Conditional split
+builder.add_conditional_edges("plot_code_executor",is_error,{               ## Condtional split
     True: "plot_error_fixer",                                               ## plot_code_executor -----> plot_error_fixer
-    False: "printer"                                                        ## |
-})                                                                          ## -------> printer
+    False: "printer",                                                       ## | 
+    "END": "printer"                                                        ## --------> printer
+})                                                                        
 
 builder.add_edge("plot_error_fixer","plot_code_executor")                   ## plot_error_fixer ---> plot_code_executor
 
@@ -536,3 +551,64 @@ react_graph = builder.compile()
 
 
 
+
+st.title("LangGraph NBA SQL Agent")
+
+st.markdown("""
+    <style>
+        [data-testid="stSidebar"] > div:first-child {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            height: 100vh;
+        }
+    </style>
+""", unsafe_allow_html=True)
+st.sidebar.header("Input")
+text = st.sidebar.text_area("Ask me queries about the database.")
+
+submit = st.sidebar.button("Submit")
+if submit:
+        try:
+            messages=[HumanMessage(content=f"{text}")]
+            response = react_graph.invoke({"messages": messages})
+            st.write(f'This is your prompt \n"{text}"')
+
+            # Getting and possibly printing generated SQL query code
+            recursion=response.get("recursion")
+            if recursion:
+                st.write("The prompt is related to the database but there was an error.")
+            else:
+                # Getting and possibly printing generated SQL query code
+                sql_query=response.get('sql_query')
+                if sql_query:
+                    st.write("SQL code generated to answer prompt")
+                    st.code(sql_query,language="sql",wrap_lines=True)
+                    
+                    # Getting and possibly printing dataframe results from SQL query
+                    df= response.get('python_df_object')
+                    if isinstance(df, pd.DataFrame) and not df.empty:
+                        st.write("This is the resulting dataframe")
+                        st.dataframe(df, use_container_width=True)
+
+                    # Getting and possibly printing plot results and code to get the plot.
+                    fig = response.get('plot_object')
+                    if isinstance(fig, matplotlib.figure.Figure):
+                        st.write("This is a plot of the dataframe using the matplotlib library in Python.")
+                        st.pyplot(fig,use_container_width=True)
+                        python_plot_code=response.get("plot_python_code")
+                        python_df_code=response.get("python_df_code")
+                        if python_df_code:
+                            st.write("Python Code used to initialize the dataframe")
+                            st.code(python_df_code,language="python",wrap_lines=True)
+                        if python_plot_code:
+                            st.write("Python Code used to Create the Plot")
+                            st.code(python_plot_code,language="python",wrap_lines=True)
+
+                # If the query is not related to the database    
+                else:
+                    st.write("Your prompt wasn't related to the database.")
+                
+               
+        except RecursionError:
+            print("Recursion Error")

@@ -1,0 +1,4 @@
+SQL_Agent/.env
+SQL_Agent/sqlconfig.py
+__pycache__/
+*.pyc
